@@ -62,6 +62,17 @@
      同备注不同有效期等内容冲突返回 409；
    - 仅已结算实验可生成（409）；生成与撤销均以 `share_create` / `share_revoke`
      写入现有操作时间线（同事务，失败不留痕）；管理台结算后提供可视化卡片。
+11. **复测配对对照（跨场比较）**：负责人凭**两场实验的测试码与各自管理令牌**调用
+    `POST /api/compare`，判断同一批评员复测后的辨别表现是否改变：
+    - 两场必须**不同、均已结算、样本编号集合相同**（A/B 顺序可交换），否则明确拒绝；
+    - 按两场有效名单中**去首尾空白后完全同名**的评员配对，仅**双方均提交 1～3 杯
+      答案**者纳入；撤回、弃权、未交与仅出现在一场者排除，并分别返回
+      **未配对人数**与**已配对但无效人数**；
+    - 返回双方都对 / 仅首场对 / 仅次场对 / 都错四格汇总，按两类仅一场答对人数计算
+      **精确双侧配对二项检验 p 值**（无有效配对时 p 为空并说明无法比较，
+      不一致对为 0 时 p=1，**p ≤ 0.05 才标记有差异**）；
+    - 只返回汇总计数与结论，**不返回个人答案、杯序或盲评码**；接口只读，
+      不改变两场实验状态，也不写入操作时间线。
 
 **评员**
 
@@ -140,7 +151,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 （原因校验、名单/答卷冻结、重复结束幂等、结束后立即结算、结束与答卷写锁竞争、
 时间线 end 事件）、操作时间线的顺序/盲态/
 原子性/并发一致性、旧数据库升级的记录起点标记，以及脱敏结果分享凭证的生成幂等/
-内容冲突/只读脱敏白名单/到期与撤销拒绝/时间线审计/旧库兼容）：
+内容冲突/只读脱敏白名单/到期与撤销拒绝/时间线审计/旧库兼容、复测配对对照
+（前置校验拒绝、A/B 对调接受、配对/无效/未配对计数、四格汇总、精确双侧 p 值、
+无有效配对 p 为空、响应脱敏））：
 
 ```bash
 pip install -r requirements.txt
@@ -160,6 +173,7 @@ python tests/smoke_test.py
 | POST | `/api/tests/{code}/shares` | 为**已结算**实验生成脱敏结果分享凭证（有效期 ≤ 7 天，备注可选） |
 | POST | `/api/tests/{code}/shares/{share_code}/revoke` | 到期前撤销分享凭证 |
 | GET  | `/api/shares/{share_code}` | 不记名只读脱敏结果（到期 / 撤销后拒绝） |
+| POST | `/api/compare` | 复测配对对照：凭两场已结算实验的测试码 + 各自令牌，按同名评员配对做精确双侧配对二项检验 |
 | GET  | `/api/eval/{code}` | 评员视图（结算前无任何分配/样本信息） |
 | POST | `/api/eval/{code}/submit` | 提交 `{"answer":1|2|3}` 或 `{"abstain":true}` |
 | GET  | `/api/time` | 服务端当前时间（毫秒） |
@@ -421,6 +435,72 @@ curl "http://localhost:8080/api/tests/AbCdEf12/timeline?token=负责人令牌"
 任一校验失败整体回滚，时间线不会出现半截记录；并发操作以实际先拿到写锁并提交者为准，
 事件 `seq` 顺序与数据库最终状态一致。
 
+### 复测配对对照接口调用示例
+
+同一批评员在两场实验中复测后，负责人可凭**两场实验的测试码与各自管理令牌**
+做配对对照，判断辨别表现是否发生变化（精确双侧配对二项检验，即 McNemar 精确检验）。
+
+`POST /api/compare`，请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `first_test_code` | string | 首场实验测试码（必填） |
+| `first_token` | string | 首场实验负责人令牌（必填） |
+| `second_test_code` | string | 次场实验测试码（必填） |
+| `second_token` | string | 次场实验负责人令牌（必填） |
+
+```bash
+curl -X POST http://localhost:8080/api/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"first_test_code":"AbCdEf12","first_token":"首场负责人令牌",
+       "second_test_code":"XyZwVu34","second_token":"次场负责人令牌"}'
+```
+
+成功响应（仅汇总计数，不含任何个人答案、杯序或盲评码）：
+
+```json
+{
+  "first_test_code": "AbCdEf12",
+  "second_test_code": "XyZwVu34",
+  "sample_a": "茉莉",
+  "sample_b": "玫瑰",
+  "sample_order_swapped": false,
+  "paired_count": 9,
+  "paired_valid_count": 8,
+  "paired_invalid_count": 1,
+  "unpaired_count": 2,
+  "unpaired_first_only": 1,
+  "unpaired_second_only": 1,
+  "both_correct": 3,
+  "only_first_correct": 4,
+  "only_second_correct": 0,
+  "both_wrong": 1,
+  "p_value": 0.125,
+  "changed": false,
+  "conclusion": "有效配对 8 人：双方都对 3 人、仅首场对 4 人、仅次场对 0 人、都错 1 人；精确双侧配对二项检验 p=0.1250 > 0.05：证据未达阈值，不能判为辨别表现有变化。"
+}
+```
+
+配对与判定规则：
+
+- **前置校验**：两场必须是**不同**实验（同一测试码 422）；两场都必须**已结算**
+  （未结算 409，指明是哪一场）；两场的**样本编号集合必须相同**——A/B 顺序可对调
+  （响应 `sample_order_swapped` 标示次场是否对调），集合不一致 409；
+  任一测试码不存在 404、对应令牌错误 403（指明是哪一场）。
+- **配对**：按两场**有效名单**中姓名（去首尾空白后完全同名）配对；
+  已撤回评员不参与配对。
+- **有效配对**：双方均提交 1～3 杯答案才纳入统计；配对但任一方弃权或未交计入
+  `paired_invalid_count`；仅出现在一场的评员计入 `unpaired_count`
+  （并分场给出 `unpaired_first_only` / `unpaired_second_only`）。
+- **四格汇总**：`both_correct`（双方都对）、`only_first_correct`（仅首场对）、
+  `only_second_correct`（仅次场对）、`both_wrong`（都错）。
+- **p 值**：仅按两类不一致对（仅首场对、仅次场对）人数计算**精确双侧配对二项检验**：
+  n 为不一致对总数，`p = min(1, 2·P(X ≤ 较少一方人数))`，X ~ Binomial(n, 1/2)；
+  **不一致对为 0 时 p = 1**。**无有效配对时 `p_value` 为 null**、`changed` 为 false，
+  `conclusion` 说明无法比较。**p ≤ 0.05 才标记 `changed=true`（有差异）**。
+- 该接口为**只读**：不改变两场实验的任何状态，也不写入操作时间线；
+  响应只含汇总计数与结论，**不返回个人答案、杯序（异样杯位置/样本）或盲评码**。
+
 ## 安全与使用注意
 
 - **负责人令牌只在创建测试时返回一次**，请立即保存；它与测试码共同构成管理凭证（服务端只存 SHA-256 哈希）。
@@ -435,7 +515,7 @@ curl "http://localhost:8080/api/tests/AbCdEf12/timeline?token=负责人令牌"
 app/
   main.py        # FastAPI 路由与业务逻辑（含操作时间线、脱敏结果分享凭证接口）
   db.py          # SQLite 连接、建表（tests/assignments/events/shares）、写事务、事件写入与旧库起点标记
-  stats.py       # 二项分布单侧尾概率
+  stats.py       # 二项分布单侧尾概率与精确双侧配对二项检验（复测对照）
 static/
   index.html     # 负责人首页：创建 / 进入
   admin.html     # 负责人结算台：进度、分发、结算、回看、脱敏分享凭证管理

@@ -2,7 +2,8 @@
 
 角色：
 - 实验负责人：创建测试、凭管理码 + 令牌查看进度、截止后结算并回看分配与答卷；
-  截止前可填写原因提前结束收集，立即冻结名单与答卷入口，结束后即可结算。
+  截止前可填写原因提前结束收集，立即冻结名单与答卷入口，结束后即可结算；
+  可凭两场已结算实验的测试码与各自令牌做复测配对对照（只读汇总）。
 - 评员：凭盲评码进入，截止前（且未被提前结束）仅可见三杯并提交一次（异样杯位置或弃权）。
 
 安全要点：
@@ -24,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
-from .stats import binomial_tail
+from .stats import binomial_tail, paired_binomial_p
 
 STATIC_DIR = "static"
 ABSTAIN = -1
@@ -155,6 +156,29 @@ def settlement_conclusion(frozen) -> str:
     return (
         f"有效答卷 {frozen['valid_count']} 份、答对 {frozen['correct_count']} 份，"
         f"单侧尾概率 p={frozen['p_value']:.4f} ≤ 0.05：判为可辨。"
+    )
+
+
+def compare_conclusion(valid_pairs: int, both_correct: int, only_first: int,
+                       only_second: int, both_wrong: int,
+                       p: Optional[float]) -> str:
+    """复测配对对照结论文案（compare 接口使用）。"""
+    if valid_pairs == 0:
+        return ("两场实验中同名且双方均提交 1～3 杯答案的有效配对为 0 人，"
+                "无法比较复测前后辨别表现是否变化。")
+    head = (
+        f"有效配对 {valid_pairs} 人：双方都对 {both_correct} 人、"
+        f"仅首场对 {only_first} 人、仅次场对 {only_second} 人、"
+        f"都错 {both_wrong} 人；"
+    )
+    if p <= 0.05:
+        return (
+            head + f"精确双侧配对二项检验 p={p:.4f} ≤ 0.05："
+            "判为复测前后辨别表现有差异。"
+        )
+    return (
+        head + f"精确双侧配对二项检验 p={p:.4f} > 0.05："
+        "证据未达阈值，不能判为辨别表现有变化。"
     )
 
 
@@ -290,6 +314,14 @@ class ShareRevoke(BaseModel):
     token: str
 
 
+class CompareTests(BaseModel):
+    """负责人跨场配对对照：两场实验的测试码与各自管理令牌。"""
+    first_test_code: str = Field(min_length=1)
+    first_token: str = Field(min_length=1)
+    second_test_code: str = Field(min_length=1)
+    second_token: str = Field(min_length=1)
+
+
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
@@ -300,7 +332,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.4", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.5", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -1069,6 +1101,139 @@ def read_share(share_code: str):
         "abstained": agg["abstained"] or 0,
         "missing": agg["missing"] or 0,
     }, now)
+
+
+# ---------------------------------------------------------------------------
+# 复测配对对照（同一批评员两场已结算实验的跨场比较，只读）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/compare")
+def compare_tests(body: CompareTests):
+    """负责人凭两场实验的测试码与各自管理令牌，比较同一批评员复测前后的辨别表现。
+
+    - 两场必须是不同实验、均已结算、样本编号集合相同（A/B 顺序可交换），
+      否则明确拒绝（422/409）。
+    - 按两场有效名单中去首尾空白后完全同名的评员配对；已撤回者不参与配对。
+      仅双方均提交 1～3 杯答案者纳入统计；配对但任一方弃权/未交计入
+      paired_invalid_count；仅出现在一场者计入 unpaired_count。
+    - 返回双方都对 / 仅首场对 / 仅次场对 / 都错四格汇总，按两类仅一场答对
+      人数计算精确双侧配对二项检验 p 值；无有效配对时 p 为空并说明无法比较，
+      不一致对为 0 时 p=1，p ≤ 0.05 才标记 changed=true。
+    - 只返回汇总计数与结论，不返回个人答案、杯序或盲评码；只读，不写时间线。
+    """
+    first_code = body.first_test_code.strip()
+    second_code = body.second_test_code.strip()
+    if first_code == second_code:
+        raise HTTPException(status_code=422,
+                            detail="两场实验必须不同，不能与自身配对对照")
+
+    conn = db.read_conn()
+    try:
+        row1 = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (first_code,)
+        ).fetchone()
+        if row1 is None:
+            raise HTTPException(status_code=404, detail="首场测试不存在")
+        row2 = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (second_code,)
+        ).fetchone()
+        if row2 is None:
+            raise HTTPException(status_code=404, detail="次场测试不存在")
+        for row, token, label in (
+            (row1, body.first_token, "首场"),
+            (row2, body.second_token, "次场"),
+        ):
+            if not token or not secrets.compare_digest(
+                hash_token(row["code"], token), row["token_hash"]
+            ):
+                raise HTTPException(status_code=403,
+                                    detail=f"{label}管理令牌无效")
+
+        if row1["settled_at"] is None:
+            raise HTTPException(status_code=409,
+                                detail="首场实验尚未结算，无法配对对照")
+        if row2["settled_at"] is None:
+            raise HTTPException(status_code=409,
+                                detail="次场实验尚未结算，无法配对对照")
+        if {row1["sample_a"], row1["sample_b"]} != \
+                {row2["sample_a"], row2["sample_b"]}:
+            raise HTTPException(status_code=409,
+                                detail="两场实验的样本编号集合不一致，无法配对对照")
+
+        assigns1 = conn.execute(
+            "SELECT panelist, answer, odd_pos FROM assignments "
+            "WHERE test_id = ? AND status = ?",
+            (row1["id"], ACTIVE),
+        ).fetchall()
+        assigns2 = conn.execute(
+            "SELECT panelist, answer, odd_pos FROM assignments "
+            "WHERE test_id = ? AND status = ?",
+            (row2["id"], ACTIVE),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    def roster(rows):
+        # 有效名单：姓名去首尾空白后完全同名者配对（库内姓名本已 trim 且唯一）
+        m = {}
+        for r in rows:
+            name = (r["panelist"] or "").strip()
+            if name:
+                m[name] = r
+        return m
+
+    map1, map2 = roster(assigns1), roster(assigns2)
+    common = set(map1) & set(map2)
+    unpaired_first = len(set(map1) - set(map2))
+    unpaired_second = len(set(map2) - set(map1))
+
+    paired_invalid = 0
+    both_correct = only_first = only_second = both_wrong = 0
+    for name in common:
+        a1, a2 = map1[name], map2[name]
+        valid1 = a1["answer"] not in (None, ABSTAIN)
+        valid2 = a2["answer"] not in (None, ABSTAIN)
+        if not (valid1 and valid2):
+            paired_invalid += 1
+            continue
+        correct1 = a1["answer"] == a1["odd_pos"]
+        correct2 = a2["answer"] == a2["odd_pos"]
+        if correct1 and correct2:
+            both_correct += 1
+        elif correct1:
+            only_first += 1
+        elif correct2:
+            only_second += 1
+        else:
+            both_wrong += 1
+
+    valid_pairs = both_correct + only_first + only_second + both_wrong
+    p = None if valid_pairs == 0 else paired_binomial_p(only_first, only_second)
+    changed = p is not None and p <= 0.05
+
+    return {
+        "first_test_code": row1["code"],
+        "second_test_code": row2["code"],
+        "sample_a": row1["sample_a"],
+        "sample_b": row1["sample_b"],
+        # 次场样本编号顺序是否与首场对调（集合相同前提下的提示信息）
+        "sample_order_swapped": row1["sample_a"] != row2["sample_a"],
+        "paired_count": len(common),
+        "paired_valid_count": valid_pairs,
+        "paired_invalid_count": paired_invalid,
+        "unpaired_count": unpaired_first + unpaired_second,
+        "unpaired_first_only": unpaired_first,
+        "unpaired_second_only": unpaired_second,
+        "both_correct": both_correct,
+        "only_first_correct": only_first,
+        "only_second_correct": only_second,
+        "both_wrong": both_wrong,
+        "p_value": p,
+        "changed": changed,
+        "conclusion": compare_conclusion(
+            valid_pairs, both_correct, only_first, only_second, both_wrong, p
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
