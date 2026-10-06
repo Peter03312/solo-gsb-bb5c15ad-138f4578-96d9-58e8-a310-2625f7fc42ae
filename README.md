@@ -62,6 +62,23 @@
      同备注不同有效期等内容冲突返回 409；
    - 仅已结算实验可生成（409）；生成与撤销均以 `share_create` / `share_revoke`
      写入现有操作时间线（同事务，失败不留痕）；管理台结算后提供可视化卡片。
+11. **两场复测配对对照（判断辨别表现是否改变）**：实验负责人凭**两场实验各自的
+    测试码与管理令牌**调用 `POST /api/compare` 做配对比较：
+    - **准入条件**：两场测试码分别存在且令牌各自正确；两场必须**不同**、**均已结算**；
+      两场**样本编号集合相同**（A/B 顺序允许交换）。任一不满足明确拒绝
+      （404/403/422/409，见调用示例）；
+    - **配对规则**：以两场有效名单中**去首尾空白后完全同名**的评员配对
+      （已撤回者不在名单内）；仅双方均提交 **1～3 杯答案**（非未交、非弃权）者纳入；
+      **撤回、弃权、未交和仅出现在一场者一律排除**；
+    - 仅返回**聚合结果**：`未配对人数`、`已配对但无效人数`，以及
+      **双方都对 / 仅首场对 / 仅次场对 / 双方都错**四类人数——
+      **不返回任何个人答案、杯序（异样杯位置）或盲评码**；
+    - 按「仅一场答对」的两类人数（记首场→次场由对变错 `b`、由错变对 `c`）做
+      **精确双侧配对二项检验（McNemar 精确检验）**：在「变化方向各半」原假设下
+      `p = 2·P(X ≥ max(b,c) | X ~ Binomial(b+c, 1/2))`；
+      **无有效配对时 `p_value` 为 `null` 并说明无法比较；差异人数为 0 时 `p=1`；
+      仅 `p ≤ 0.05` 才标记 `different=true`**；
+    - 对照为只读操作，**不改动两场的结算冻结结果，也不写入时间线**。
 
 **评员**
 
@@ -139,8 +156,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 撤回/补位、均衡再分配、有效人数上下限、撤回与答卷并发竞争、负责人提前结束收集
 （原因校验、名单/答卷冻结、重复结束幂等、结束后立即结算、结束与答卷写锁竞争、
 时间线 end 事件）、操作时间线的顺序/盲态/
-原子性/并发一致性、旧数据库升级的记录起点标记，以及脱敏结果分享凭证的生成幂等/
-内容冲突/只读脱敏白名单/到期与撤销拒绝/时间线审计/旧库兼容）：
+原子性/并发一致性、旧数据库升级的记录起点标记、脱敏结果分享凭证的生成幂等/
+内容冲突/只读脱敏白名单/到期与撤销拒绝/时间线审计/旧库兼容，以及两场复测
+配对对照的同名配对/撤回弃权未交排除/未配对与配对无效计数/四类汇总/精确双侧
+配对二项检验（差异为 0 时 p=1、无有效配对时 p=null）/A-B 顺序交换/名单部分
+不同/准入拒绝矩阵/只读不写时间线与不泄露个人数据白名单）：
 
 ```bash
 pip install -r requirements.txt
@@ -160,6 +180,7 @@ python tests/smoke_test.py
 | POST | `/api/tests/{code}/shares` | 为**已结算**实验生成脱敏结果分享凭证（有效期 ≤ 7 天，备注可选） |
 | POST | `/api/tests/{code}/shares/{share_code}/revoke` | 到期前撤销分享凭证 |
 | GET  | `/api/shares/{share_code}` | 不记名只读脱敏结果（到期 / 撤销后拒绝） |
+| POST | `/api/compare` | 两场已结算实验的同名评员配对对照（精确双侧配对二项检验） |
 | GET  | `/api/eval/{code}` | 评员视图（结算前无任何分配/样本信息） |
 | POST | `/api/eval/{code}/submit` | 提交 `{"answer":1|2|3}` 或 `{"abstain":true}` |
 | GET  | `/api/time` | 服务端当前时间（毫秒） |
@@ -252,6 +273,91 @@ curl -X POST http://localhost:8080/api/tests/AbCdEf12/shares/rT4kPq7mWx2ZaB9c/re
 - 负责人进度接口 `GET /api/tests/{code}` 以纯增量字段 `shares[]`
   返回该实验全部凭证及其状态；管理台（`/admin`）在结算后提供
   「脱敏结果分享凭证」卡片，可直接生成、复制地址与撤销。
+
+### 两场复测配对对照接口调用示例
+
+`POST /api/compare`，请求体（两场的测试码与**各自**管理令牌分别提供）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `first_code` | string | 首场实验测试码（必填） |
+| `first_token` | string | 首场实验负责人令牌（必填） |
+| `second_code` | string | 次场实验测试码（必填） |
+| `second_token` | string | 次场实验负责人令牌（必填） |
+
+```bash
+curl -X POST http://localhost:8080/api/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"first_code":"AbCdEf12","first_token":"首场负责人令牌",
+       "second_code":"ZyXwVu98","second_token":"次场负责人令牌"}'
+```
+
+成功响应（**只有聚合计数**，不含评员姓名、个人答案、杯序或盲评码）：
+
+```json
+{
+  "first_test_code": "AbCdEf12",
+  "second_test_code": "ZyXwVu98",
+  "first_samples": {"sample_a": "茉莉", "sample_b": "玫瑰"},
+  "second_samples": {"sample_a": "玫瑰", "sample_b": "茉莉"},
+  "samples_swapped": true,
+  "unpaired_count": 1,
+  "paired_invalid_count": 2,
+  "valid_pair_count": 8,
+  "both_correct_count": 0,
+  "first_only_correct_count": 0,
+  "second_only_correct_count": 6,
+  "both_wrong_count": 2,
+  "p_value": 0.03125,
+  "different": true,
+  "conclusion": "有效配对 8 人：两场都对 0 人、仅首场对 0 人、仅次场对 6 人、两场都错 2 人。按仅一场答对的 6 人做精确双侧配对二项检验，p=0.0313 ≤ 0.05：两场辨别表现有差异。次场答对而首场答错者更多，复测辨别表现提升。",
+  "now": 1759004000000
+}
+```
+
+字段含义：
+
+| 字段 | 含义 |
+| --- | --- |
+| `samples_swapped` | 两场样本编号集合相同、但 A/B 顺序交换（合法，不影响配对） |
+| `unpaired_count` | **未配对人数**：只出现在一场有效名单的评员数（含仅一场被撤回者） |
+| `paired_invalid_count` | **已配对但无效人数**：同名配对但至少一方弃权 / 未交 / 撤回 |
+| `valid_pair_count` | 双方均提交 1～3 杯答案的有效配对人数（四类计数之和） |
+| `both_correct_count` | 两场都答对的人数 |
+| `first_only_correct_count` | 仅首场答对（首场对、次场错）的人数 `b` |
+| `second_only_correct_count` | 仅次场答对（首场错、次场对）的人数 `c` |
+| `both_wrong_count` | 两场都答错的人数 |
+| `p_value` | 精确双侧配对二项检验 p 值；**无有效配对时为 `null`**；差异人数 `b+c=0` 时为 `1` |
+| `different` | **仅当 `p_value ≤ 0.05` 时为 `true`**（无有效配对 / 无法比较时为 `false`） |
+
+检验说明：双方都对、双方都错的评员不含方向信息，不进入检验统计量；
+仅按「仅一场答对」的 `n=b+c` 人，在原假设“变化方向各半（p=1/2）”下计算
+
+`p = 2 · P(X ≥ max(b,c))，X ~ Binomial(n, 1/2)`（精确二项求和，非正态近似）。
+
+边界与规则：
+
+- **无有效配对**（`valid_pair_count=0`）：HTTP 仍为 200，`p_value=null`、
+  `different=false`，结论明确写明“无法进行配对比较”；
+- **差异人数为 0**（两场对错完全一致）：`p_value=1`、`different=false`；
+- `n=1` 时双侧 p 值恒为 1（单次变化不可能达到双侧 0.05）；
+  最小可显著组合为 `n≥5` 且方向全在一侧（`n=5, b=0` 时 `p=0.0625` 仍不显著，
+  `n=6, b=0` 时 `p=0.03125` 显著）；
+- 交换首场 / 次场再请求：`first_only_correct_count` 与
+  `second_only_correct_count` 互换，p 值不变，结论方向（提升 / 下降）相应翻转；
+- 对照为只读：两场的结算冻结结果、操作时间线均不发生任何变化。
+
+准入拒绝（不返回任何评员数据）：
+
+| HTTP | detail 含义 |
+| --- | --- |
+| 404 | 首场 / 次场测试不存在（先校验首场存在及其令牌，再校验次场） |
+| 403 | 对应场次的管理令牌无效（恒定时间比较，两场分别鉴权） |
+| 422 | 两场测试码相同（不能与自身配对）；两场样本编号集合不同 |
+| 409 | 首场 / 次场尚未结算（只有两场均已结算才能对照） |
+
+> 注：评员名单**不要求**两场完全一致——只出现在一场的评员不参与配对，
+> 其人数体现在 `unpaired_count` 中。
 
 ### 名单调整接口调用示例
 
@@ -433,9 +539,9 @@ curl "http://localhost:8080/api/tests/AbCdEf12/timeline?token=负责人令牌"
 
 ```
 app/
-  main.py        # FastAPI 路由与业务逻辑（含操作时间线、脱敏结果分享凭证接口）
+  main.py        # FastAPI 路由与业务逻辑（含操作时间线、脱敏结果分享凭证、两场配对对照接口）
   db.py          # SQLite 连接、建表（tests/assignments/events/shares）、写事务、事件写入与旧库起点标记
-  stats.py       # 二项分布单侧尾概率
+  stats.py       # 二项分布单侧尾概率；配对二项检验（McNemar 精确检验）双侧 p 值
 static/
   index.html     # 负责人首页：创建 / 进入
   admin.html     # 负责人结算台：进度、分发、结算、回看、脱敏分享凭证管理

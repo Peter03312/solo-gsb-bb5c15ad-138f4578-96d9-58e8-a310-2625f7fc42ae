@@ -19,7 +19,7 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.stats import binomial_tail  # noqa: E402
+from app.stats import binomial_tail, paired_binomial_two_sided  # noqa: E402
 
 P, Q = 1 / 3, 2 / 3
 FAILS = []
@@ -65,6 +65,41 @@ check("n=200 正规范围内尾概率随 k 单调不增",
           for i in range(len(meaningful) - 1)))
 check("n=200 次正规尾概率截断为 0 且无负值",
       all(x == 0.0 for x in seq if x < 2.3e-308) and min(seq) >= 0)
+
+
+# ---------------------------------------------------------------------------
+# 1b. 配对二项检验（McNemar 精确检验）双侧 p 值：与直接 comb 求和交叉验证
+# ---------------------------------------------------------------------------
+
+def ref_paired(n, k):
+    if n <= 0:
+        return 1.0
+    kk = max(k, n - k)
+    return min(1.0, 2 * sum(math.comb(n, i) for i in range(kk, n + 1)) / 2 ** n)
+
+
+for n in range(0, 61):
+    for k in range(0, n + 1):
+        got = paired_binomial_two_sided(n, k)
+        want = ref_paired(n, k)
+        assert abs(got - want) < 1e-12, (n, k, got, want)
+
+check("配对二项双侧 p 与直接求和一致 (0≤n≤60)", True)
+check("配对：差异人数 0 → p=1", paired_binomial_two_sided(0, 0) == 1.0)
+check("配对：n=1 单侧极端也为 1（双侧不显著）",
+      paired_binomial_two_sided(1, 0) == 1.0
+      and paired_binomial_two_sided(1, 1) == 1.0)
+check("配对：n=6 全同向 p=2/64=0.03125",
+      abs(paired_binomial_two_sided(6, 0) - 2 / 64) < 1e-12
+      and abs(paired_binomial_two_sided(6, 6) - 2 / 64) < 1e-12,
+      paired_binomial_two_sided(6, 0))
+check("配对：n=6 五对一 p=0.21875",
+      abs(paired_binomial_two_sided(6, 1) - 0.21875) < 1e-12)
+check("配对：n=11 九对二 p≈0.0654 不显著",
+      abs(paired_binomial_two_sided(11, 2) - 0.0654296875) < 1e-12)
+check("配对：对称性 p(k)=p(n-k)",
+      all(abs(paired_binomial_two_sided(n, k) - paired_binomial_two_sided(n, n - k))
+          < 1e-12 for n in range(0, 40) for k in range(0, n + 1)))
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +480,11 @@ try:
         (bal["test_code"],)).fetchall()
     pc = {p: sum(1 for r in after if r["odd_pos"] == p) for p in (1, 2, 3)}
     sc = {x: sum(1 for r in after if r["odd_sample"] == x) for x in ("A", "B")}
-    check("撤回+补位后异样杯位置仍均衡 3/3/3", list(pc.values()) == [3, 3, 3],
+    # 已有评员杯序不可变：撤 3 补 2 且撤回集中在同一档时（如 4/3/0），
+    # 补位只能加在最少档，最终 4/3/2（极差 2）即不重排前提下的可达最优；
+    # 不要求必然 3/3/3，只校验总数正确且各档极差 ≤ 2。
+    check("撤回+补位后异样杯位置总数 9 且计数极差 ≤ 2（不重排前提下可达最优）",
+          sum(pc.values()) == 9 and max(pc.values()) - min(pc.values()) <= 2,
           str(pc))
     check("撤回+补位后异样样本仍均衡 (4/5 或 5/4)",
           sorted(sc.values()) == [4, 5], str(sc))
@@ -1172,6 +1211,252 @@ try:
     check("并发：结束后立即结算，冻结先完成的答卷",
           st == 200 and rcrep["valid_count"] == n_answer_win
           and rcrep["missing_count"] == 30 - n_answer_win, str(rcrep))
+
+    # --- 2.12 两场复测配对对照（精确双侧配对二项检验 / McNemar 精确检验） ---
+    def make_settled(sample_a, sample_b, panelists, plans, code_hint=""):
+        """创建一场实验、按 plans（与 panelists 同序）提交并立即结算。
+
+        plans 每项：correct / wrong / abstain / missing。
+        返回 (compare 所需 (code, token), 按姓名索引的 assignment rows)。
+        """
+        s, tt = req("POST", "/api/tests", {
+            "sample_a": sample_a, "sample_b": sample_b,
+            "panelists": panelists,
+            "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+        assert s == 200, (code_hint, tt)
+        rows = con.execute(
+            "SELECT * FROM assignments WHERE test_id="
+            "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+            (tt["test_code"],)).fetchall()
+        assert len(rows) == len(panelists)
+        for r, plan in zip(rows, plans):
+            if plan == "missing":
+                continue
+            if plan == "abstain":
+                stt, _ = req("POST", f"/api/eval/{r['code']}/submit",
+                             {"abstain": True})
+            else:
+                ans = r["odd_pos"] if plan == "correct" else (r["odd_pos"] % 3 + 1)
+                stt, _ = req("POST", f"/api/eval/{r['code']}/submit",
+                             {"answer": ans})
+            assert stt == 200, (code_hint, r["panelist"], plan)
+        con.execute("UPDATE tests SET deadline=? WHERE code=?",
+                    (int(time.time()) - 10, tt["test_code"]))
+        con.commit()
+        stt, rep = req("POST", f"/api/tests/{tt['test_code']}/settle",
+                       {"token": tt["token"]})
+        assert stt == 200 and rep["settled_at"] is not None, (code_hint, rep)
+        by_name = {r["panelist"]: r for r in rows}
+        return (tt["test_code"], tt["token"]), by_name
+
+    def compare(c1, tok1, c2, tok2):
+        return req("POST", "/api/compare", {
+            "first_code": c1, "first_token": tok1,
+            "second_code": c2, "second_token": tok2})
+
+    compare_allowed = {
+        "first_test_code", "second_test_code", "first_samples", "second_samples",
+        "samples_swapped", "unpaired_count", "paired_invalid_count",
+        "valid_pair_count", "both_correct_count", "first_only_correct_count",
+        "second_only_correct_count", "both_wrong_count",
+        "p_value", "different", "conclusion", "now"}
+
+    # 场景 A：同名单 10 人，覆盖全部配对类别
+    names_a = [f"a{i}" for i in range(10)]
+    plans_a1 = ["correct"] * 2 + ["wrong"] * 2 + ["correct"] * 2 + ["wrong"] * 2 \
+        + ["abstain", "missing"]
+    plans_a2 = ["correct"] * 2 + ["wrong"] * 2 + ["wrong"] * 2 + ["correct"] * 2 \
+        + ["missing", "abstain"]
+    A1, _ = make_settled("茉莉", "玫瑰", names_a, plans_a1, "A1")
+    A2, _ = make_settled("茉莉", "玫瑰", names_a, plans_a2, "A2")
+    s, cmp_a = compare(*A1, *A2)
+    check("配对：同名单同序对照 200", s == 200, str(cmp_a))
+    check("配对：未配对=0/配对无效=2（弃权+未交）",
+          cmp_a["unpaired_count"] == 0 and cmp_a["paired_invalid_count"] == 2
+          and cmp_a["valid_pair_count"] == 8, str(cmp_a))
+    check("配对：都对2/仅首场对2/仅次场对2/都错2",
+          cmp_a["both_correct_count"] == 2
+          and cmp_a["first_only_correct_count"] == 2
+          and cmp_a["second_only_correct_count"] == 2
+          and cmp_a["both_wrong_count"] == 2, str(cmp_a))
+    check("配对：n=4 各半 p=1.0000 无差异",
+          abs(cmp_a["p_value"] - 1.0) < 1e-12 and cmp_a["different"] is False,
+          str(cmp_a["p_value"]))
+    check("配对：响应字段严格等于白名单（无个人答案/杯序/盲评码）",
+          set(cmp_a.keys()) == compare_allowed, str(cmp_a.keys()))
+    blob_a = json.dumps(cmp_a, ensure_ascii=False)
+    for forbidden in ("odd_pos", "odd_sample", "盲评码", "answer", "code\""):
+        check(f"配对：响应不含 {forbidden!r}",
+              ("\"code\"" if forbidden == 'code"' else forbidden) not in blob_a,
+              blob_a)
+    check("配对：响应不含任何评员姓名",
+          all(n not in blob_a for n in names_a), blob_a)
+
+    # 场景 B：名单部分不同 + A/B 顺序交换 + 6:0 显著（次场提升）
+    names_b1 = [f"b{i}" for i in range(8)] + ["x1", "x2"]
+    names_b2 = [f"b{i}" for i in range(8)] + ["y1", "y2"]
+    # b0..b5 首场错次场对；b6,b7 两场都错；x* 仅首场；y* 仅次场
+    plans_b1 = ["wrong"] * 6 + ["wrong", "wrong", "correct", "correct"]
+    plans_b2 = ["correct"] * 6 + ["wrong", "wrong", "correct", "correct"]
+    B1, _ = make_settled("茉莉", "玫瑰", names_b1, plans_b1, "B1")
+    B2, _ = make_settled("玫瑰", "茉莉", names_b2, plans_b2, "B2")
+    s, cmp_b = compare(*B1, *B2)
+    check("配对：A/B 顺序交换合法 200 且 samples_swapped=true",
+          s == 200 and cmp_b["samples_swapped"] is True, str(cmp_b))
+    check("配对：未配对=4（x1,x2,y1,y2）", cmp_b["unpaired_count"] == 4,
+          str(cmp_b["unpaired_count"]))
+    check("配对：有效配对=8：仅次场对6/都错2",
+          cmp_b["valid_pair_count"] == 8
+          and cmp_b["second_only_correct_count"] == 6
+          and cmp_b["both_wrong_count"] == 2
+          and cmp_b["first_only_correct_count"] == 0
+          and cmp_b["both_correct_count"] == 0, str(cmp_b))
+    check("配对：n=6 全同向 p=0.03125 ≤ 0.05 标记有差异",
+          abs(cmp_b["p_value"] - 0.03125) < 1e-12
+          and cmp_b["different"] is True, str(cmp_b["p_value"]))
+    check("配对：结论说明复测提升", "提升" in cmp_b["conclusion"],
+          cmp_b["conclusion"])
+    # 交换首/次场：仍显著，但方向变为“下降”，p 相同
+    s, cmp_br = compare(*B2, *B1)
+    check("配对：交换场序 p 相同，方向变为仅首场对 6",
+          s == 200 and abs(cmp_br["p_value"] - 0.03125) < 1e-12
+          and cmp_br["first_only_correct_count"] == 6
+          and cmp_br["second_only_correct_count"] == 0
+          and cmp_br["samples_swapped"] is True
+          and "下降" in cmp_br["conclusion"], str(cmp_br))
+
+    # 差异人数为 0（全对/全错一致）→ p=1
+    names_p = ["p1", "p2", "p3"]
+    P1, _ = make_settled("茉莉", "玫瑰", names_p,
+                         ["correct", "wrong", "correct"], "P1")
+    P2, _ = make_settled("茉莉", "玫瑰", names_p,
+                         ["correct", "wrong", "correct"], "P2")
+    s, cmp_p = compare(*P1, *P2)
+    check("配对：差异人数 0 时 p=1（无论有多少有效配对）",
+          s == 200 and cmp_p["p_value"] == 1.0
+          and cmp_p["different"] is False
+          and cmp_p["valid_pair_count"] == 3
+          and "无差异" in cmp_p["conclusion"], str(cmp_p))
+
+    # 无有效配对：共同评员全部弃权/未交（外加各场独有者）→ p=null，无法比较
+    names_n1 = ["n1", "n2", "onlyN"]
+    names_n2 = ["n1", "n2", "onlyM"]
+    N1, _ = make_settled("茉莉", "玫瑰", names_n1,
+                         ["abstain", "missing", "correct"], "N1")
+    N2, _ = make_settled("茉莉", "玫瑰", names_n2,
+                         ["missing", "abstain", "correct"], "N2")
+    s, cmp_n = compare(*N1, *N2)
+    check("配对：无有效配对 200", s == 200, str(cmp_n))
+    check("配对：未配对=2、配对无效=2、有效配对=0",
+          cmp_n["unpaired_count"] == 2
+          and cmp_n["paired_invalid_count"] == 2
+          and cmp_n["valid_pair_count"] == 0, str(cmp_n))
+    check("配对：无有效配对时 p_value=null 且 different=false",
+          cmp_n["p_value"] is None and cmp_n["different"] is False, str(cmp_n))
+    check("配对：结论明确无法比较", "无法" in cmp_n["conclusion"]
+          and "比较" in cmp_n["conclusion"], cmp_n["conclusion"])
+
+    # 撤回者只影响其所在场名单：p8 在首场被撤回（未提交），次场在名单且答对
+    names_w = [f"w{i}" for i in range(8)]
+    W2, w2_rows = make_settled("茉莉", "玫瑰", names_w,
+                               ["correct"] * 8, "W2")
+    s, w1t = req("POST", "/api/tests", {
+        "sample_a": "茉莉", "sample_b": "玫瑰", "panelists": names_w,
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    w1_rows = con.execute(
+        "SELECT * FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+        (w1t["test_code"],)).fetchall()
+    # w0..w6 首场答错；w7 未交，在截止前撤回（故不在首场有效名单）
+    for r in w1_rows[:7]:
+        stt, _ = req("POST", f"/api/eval/{r['code']}/submit",
+                     {"answer": r["odd_pos"] % 3 + 1})
+        assert stt == 200
+    stt, _ = req("POST", f"/api/tests/{w1t['test_code']}/adjust",
+                 {"token": w1t["token"],
+                  "withdraw_codes": [w1_rows[7]["code"]]})
+    assert stt == 200
+    con.execute("UPDATE tests SET deadline=? WHERE code=?",
+                (int(time.time()) - 10, w1t["test_code"]))
+    con.commit()
+    stt, _ = req("POST", f"/api/tests/{w1t['test_code']}/settle",
+                 {"token": w1t["token"]})
+    assert stt == 200
+    W1 = (w1t["test_code"], w1t["token"])
+    s, cmp_w = compare(*W1, *W2)
+    check("配对：首场撤回者不在名单→计未配对（unpaired=1）",
+          s == 200 and cmp_w["unpaired_count"] == 1
+          and cmp_w["paired_invalid_count"] == 0
+          and cmp_w["valid_pair_count"] == 7
+          and cmp_w["second_only_correct_count"] == 7
+          and cmp_w["both_wrong_count"] == 0, str(cmp_w))
+
+    # 评员姓名两端空白以库内归一化后的姓名同名配对（创建时即 trim 存储）
+    names_s1 = ["  张三", "李四 ", " 王五 "]
+    names_s2 = ["张三", " 李四", "王五"]
+    S1, _ = make_settled("茉莉", "玫瑰", names_s1,
+                         ["correct", "wrong", "correct"], "S1")
+    S2, _ = make_settled("茉莉", "玫瑰", names_s2,
+                         ["wrong", "wrong", "correct"], "S2")
+    s, cmp_s = compare(*S1, *S2)
+    check("配对：姓名去首尾空白后同名配对（unpaired=0）",
+          s == 200 and cmp_s["unpaired_count"] == 0
+          and cmp_s["valid_pair_count"] == 3
+          and cmp_s["first_only_correct_count"] == 1
+          and cmp_s["second_only_correct_count"] == 0, str(cmp_s))
+
+    # ---- 准入拒绝矩阵 ----
+    # 同一场与自身配对
+    st, rej_self = compare(*A1, *A1)
+    check("配对：与自身配对被拒 (422)", st == 422 and "不同" in rej_self["detail"],
+          str(rej_self))
+    # 令牌错误（分别鉴权）
+    st, rej_t1 = compare(A1[0], "wrong-token", *A2)
+    check("配对：首场令牌错误 403", st == 403, str(st))
+    st, rej_t2 = compare(*A1, A2[0], "wrong-token")
+    check("配对：次场令牌错误 403", st == 403, str(st))
+    # 测试不存在：先验首场再验次场
+    st, rej_404a = compare("NOPE1234", "x", *A2)
+    check("配对：首场不存在 404", st == 404 and "首场" in rej_404a["detail"],
+          str(rej_404a))
+    st, rej_404b = compare(*A1, "NOPE1234", "x")
+    check("配对：首场令牌通过后次场不存在 404", st == 404
+          and "次场" in rej_404b["detail"], str(rej_404b))
+    # 样本编号集合不同
+    names_d = [f"d{i}" for i in range(3)]
+    D1, _ = make_settled("茉莉", "桂花", names_d,
+                         ["correct"] * 3, "D1")
+    st, rej_smp = compare(*D1, *A2)
+    check("配对：样本集合不同被拒 (422)", st == 422
+          and "样本编号集合不同" in rej_smp["detail"], str(rej_smp))
+    # 未结算：建一场不结算
+    s, ut = req("POST", "/api/tests", {
+        "sample_a": "茉莉", "sample_b": "玫瑰",
+        "panelists": names_a,
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    st, rej_un1 = compare(ut["test_code"], ut["token"], *A2)
+    check("配对：首场未结算 409", st == 409 and "首场" in rej_un1["detail"],
+          str(rej_un1))
+    st, rej_un2 = compare(*A1, ut["test_code"], ut["token"])
+    check("配对：次场未结算 409", st == 409 and "次场" in rej_un2["detail"],
+          str(rej_un2))
+    # 未结算实验即便名单完全不同，也先报“未结算”（准入顺序）
+    st, rej_order = compare(ut["test_code"], ut["token"], *D1)
+    check("配对：准入顺序——未结算优先于样本/名单检查",
+          st == 409 and "首场" in rej_order["detail"], str(rej_order))
+
+    # 对照表是只读的：调用后两场结算冻结结果与时间线不受影响
+    s, a1_rep = req("POST", f"/api/tests/{A1[0]}/settle", {"token": A1[1]})
+    s, a2_rep = req("POST", f"/api/tests/{A2[0]}/settle", {"token": A2[1]})
+    check("配对：对照后重复结算仍返回同一冻结结果",
+          a1_rep["settled_at"] is not None and a2_rep["settled_at"] is not None)
+    for code, tok in (A1, A2):
+        s, tlx = req("GET", f"/api/tests/{code}/timeline?token={tok}")
+        check(f"配对：{code} 时间线不新增 compare 事件",
+              s == 200 and all(e["type"] != "compare" for e in tlx["events"]),
+              str([e["type"] for e in tlx["events"]]))
 
     # --- 2.6 页面可达性 ---
     for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}"):

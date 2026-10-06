@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
-from .stats import binomial_tail
+from .stats import binomial_tail, paired_binomial_two_sided
 
 STATIC_DIR = "static"
 ABSTAIN = -1
@@ -156,6 +156,35 @@ def settlement_conclusion(frozen) -> str:
         f"有效答卷 {frozen['valid_count']} 份、答对 {frozen['correct_count']} 份，"
         f"单侧尾概率 p={frozen['p_value']:.4f} ≤ 0.05：判为可辨。"
     )
+
+
+def compare_conclusion(valid_pairs: int, both_correct: int, first_only: int,
+                       second_only: int, both_wrong: int,
+                       p_value: Optional[float], different: bool) -> str:
+    """两场配对对照的结论文案（仅聚合信息，不含任何个人数据）。"""
+    if valid_pairs == 0:
+        return (
+            "两场无任何双方均提交 1～3 杯答案的同名有效配对评员，"
+            "无法进行配对比较。"
+        )
+    head = (
+        f"有效配对 {valid_pairs} 人：两场都对 {both_correct} 人、"
+        f"仅首场对 {first_only} 人、仅次场对 {second_only} 人、"
+        f"两场都错 {both_wrong} 人。"
+    )
+    if first_only + second_only == 0:
+        return head + "两场答对情况完全一致（无变化评员），p=1.0000：辨别表现无差异。"
+    detail = f"按仅一场答对的 {first_only + second_only} 人做精确双侧配对二项检验，p={p_value:.4f}"
+    if different:
+        direction = (
+            "次场答对而首场答错者更多，复测辨别表现提升。"
+            if second_only > first_only
+            else "首场答对而次场答错者更多，复测辨别表现下降。"
+            if first_only > second_only
+            else "变化方向人数相同。"
+        )
+        return f"{head}{detail} ≤ 0.05：两场辨别表现有差异。{direction}"
+    return f"{head}{detail} > 0.05：两场辨别表现无显著差异。"
 
 
 def render_event(ev: dict, settled: bool, assign_by_code: dict) -> dict:
@@ -290,6 +319,14 @@ class ShareRevoke(BaseModel):
     token: str
 
 
+class CompareTests(BaseModel):
+    """两场实验复测配对对照：分别给出两场的测试码与各自管理令牌。"""
+    first_code: str = Field(description="首场实验测试码")
+    first_token: str = Field(description="首场实验负责人令牌")
+    second_code: str = Field(description="次场实验测试码")
+    second_token: str = Field(description="次场实验负责人令牌")
+
+
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
@@ -300,7 +337,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.4", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.5", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -1069,6 +1106,166 @@ def read_share(share_code: str):
         "abstained": agg["abstained"] or 0,
         "missing": agg["missing"] or 0,
     }, now)
+
+
+# ---------------------------------------------------------------------------
+# 两场实验复测配对对照（负责人；精确双侧配对二项检验 / McNemar 精确检验）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/compare")
+def compare_tests(body: CompareTests):
+    """判断同一批评员两场复测后的辨别表现是否改变。
+
+    准入条件（任一不满足明确拒绝，不返回任何个人数据）：
+    - 两场测试码分别存在，且各自管理令牌正确（分别鉴权）；
+    - 两场必须是不同的实验（测试码不同）；
+    - 两场均已结算；
+    - 两场样本编号集合相同（{sample_a, sample_b} 一致，A/B 顺序允许交换）。
+    名单不要求完全一致：仅出现在一场的评员不配对，计入“未配对人数”。
+
+    配对规则：
+    - 以两场有效名单（active，已撤回者不在名单内）去首尾空白后完全同名的评员配对
+      （每人至多一条有效记录，同名即唯一）；只出现在一场的评员计入“未配对人数”；
+    - 仅双方均提交 1～3 杯答案（非未交、非弃权）者纳入有效配对；
+      撤回、弃权、未交者排除，配对但至少一方无效计入“已配对但无效人数”。
+
+    输出仅为聚合计数：未配对人数、已配对但无效人数，以及两场都对 / 仅首场对 /
+    仅次场对 / 两场都错的人数；不返回个人答案、杯序或盲评码。
+
+    检验：按“仅首场对 + 仅次场对”的差异人数做精确双侧配对二项检验
+    （H0：变化方向等概率 p=1/2），p = 2·P(X ≥ 较大一侧 | X~Bin(n,1/2))；
+    无有效配对时 p 为 null 且无法比较；差异人数为 0 时 p=1；p ≤ 0.05 才标记有差异。
+    """
+    first_code = (body.first_code or "").strip()
+    second_code = (body.second_code or "").strip()
+
+    conn = db.read_conn()
+    try:
+        first = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (first_code,)
+        ).fetchone()
+        second = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (second_code,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    # 分别鉴权：测试不存在优先 404，再恒定时间校验各自令牌
+    if first is None:
+        raise HTTPException(status_code=404, detail="首场测试不存在")
+    verify_admin(first, body.first_token)
+    if second is None:
+        raise HTTPException(status_code=404, detail="次场测试不存在")
+    verify_admin(second, body.second_token)
+
+    # 两场必须不同
+    if first["id"] == second["id"]:
+        raise HTTPException(status_code=422, detail="两场实验必须不同，不能与自身配对")
+
+    # 两场均已结算
+    if first["settled_at"] is None or second["settled_at"] is None:
+        which = "首场" if first["settled_at"] is None else "次场"
+        raise HTTPException(status_code=409, detail=f"{which}实验尚未结算，不能配对对照")
+
+    # 样本编号集合必须相同（A/B 顺序可交换）
+    samples_first = {first["sample_a"].strip(), first["sample_b"].strip()}
+    samples_second = {second["sample_a"].strip(), second["sample_b"].strip()}
+    if samples_first != samples_second:
+        raise HTTPException(
+            status_code=422,
+            detail=f"两场样本编号集合不同：首场 {sorted(samples_first)}、"
+                   f"次场 {sorted(samples_second)}，不能配对对照",
+        )
+
+    conn = db.read_conn()
+    try:
+        first_assigns = conn.execute(
+            "SELECT panelist, answer, odd_pos FROM assignments "
+            "WHERE test_id = ? AND status = ?",
+            (first["id"], ACTIVE),
+        ).fetchall()
+        second_assigns = conn.execute(
+            "SELECT panelist, answer, odd_pos FROM assignments "
+            "WHERE test_id = ? AND status = ?",
+            (second["id"], ACTIVE),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # 去首尾空白后按同名建索引（库内每场有效名单姓名唯一：UNIQUE(test_id, panelist)）
+    def index_by_name(rows):
+        return {a["panelist"].strip(): a for a in rows}
+
+    first_map = index_by_name(first_assigns)
+    second_map = index_by_name(second_assigns)
+    first_names, second_names = set(first_map), set(second_map)
+
+    # 名单不要求一致：仅一场出现的评员不配对，计入“未配对人数”
+    common_names = first_names & second_names
+    unpaired = len(first_names) + len(second_names) - 2 * len(common_names)
+
+    def valid_correct(a) -> Optional[bool]:
+        """提交 1～3 杯答案返回对错；未交（NULL）/弃权（-1）/撤回（不在名单）返回 None。"""
+        if a["answer"] is None or a["answer"] == ABSTAIN:
+            return None
+        return a["answer"] == a["odd_pos"]
+
+    both_correct = first_only_correct = second_only_correct = both_wrong = 0
+    paired_invalid = 0
+    for name in common_names:
+        c1 = valid_correct(first_map[name])
+        c2 = valid_correct(second_map[name])
+        if c1 is None or c2 is None:
+            paired_invalid += 1
+            continue
+        if c1 and c2:
+            both_correct += 1
+        elif c1 and not c2:
+            first_only_correct += 1
+        elif not c1 and c2:
+            second_only_correct += 1
+        else:
+            both_wrong += 1
+
+    valid_pairs = (both_correct + first_only_correct
+                   + second_only_correct + both_wrong)
+
+    if valid_pairs == 0:
+        p_value = None
+        different = False
+    else:
+        n_disagree = first_only_correct + second_only_correct
+        if n_disagree == 0:
+            p_value = 1.0
+        else:
+            p_value = paired_binomial_two_sided(n_disagree, first_only_correct)
+        different = p_value <= 0.05
+
+    return {
+        "first_test_code": first["code"],
+        "second_test_code": second["code"],
+        "first_samples": {"sample_a": first["sample_a"],
+                          "sample_b": first["sample_b"]},
+        "second_samples": {"sample_a": second["sample_a"],
+                           "sample_b": second["sample_b"]},
+        "samples_swapped": (
+            first["sample_a"].strip() == second["sample_b"].strip()
+            and first["sample_b"].strip() == second["sample_a"].strip()
+        ),
+        "unpaired_count": unpaired,
+        "paired_invalid_count": paired_invalid,
+        "valid_pair_count": valid_pairs,
+        "both_correct_count": both_correct,
+        "first_only_correct_count": first_only_correct,
+        "second_only_correct_count": second_only_correct,
+        "both_wrong_count": both_wrong,
+        "p_value": p_value,
+        "different": different,
+        "conclusion": compare_conclusion(
+            valid_pairs, both_correct, first_only_correct,
+            second_only_correct, both_wrong, p_value, different),
+        "now": now_ts() * 1000,
+    }
 
 
 # ---------------------------------------------------------------------------
